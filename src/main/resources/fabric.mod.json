@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "feather_world_menu",
+  "version": "${version}",
+  "name": "Feather World Menu",
+  "description": "HUD style menu inspired by custom server profile cards.",
+  "authors": [
+    "kirigaya81"
+  ],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "fr.iron8.feathermenu.FeatherWorldMenuClient"
+    ]
+  },
+  "mixins": [
+    "feather_world_menu.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "1.21.8",
+    "fabric-api": "*"
+  }
+}

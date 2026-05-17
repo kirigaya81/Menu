@@ -1,0 +1,31 @@
+# Gradle
+.gradle/
+.tools/
+build/
+out/
+bin/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.code-workspace
+.classpath
+.project
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & local runtime
+*.log
+run/
+logs/
+
+# Cursor / agent
+.cursor/
+*.cursor/

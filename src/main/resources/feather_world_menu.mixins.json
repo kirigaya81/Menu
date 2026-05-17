@@ -1,0 +1,9 @@
+{
+  "required": true,
+  "package": "fr.iron8.feathermenu.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "MinecraftClientMixin",
+    "MouseMixin"
+  ]
+}
