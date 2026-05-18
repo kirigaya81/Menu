@@ -1,10 +1,11 @@
 package fr.iron8.feathermenu;
 
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.gui.DrawContext;
-import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.client.util.InputUtil;
@@ -81,6 +82,9 @@ public final class WorldHudOverlay {
     /** Anti-doublon pour les lignes log qui correspondent exactement à une entrée Lac du menu Options. */
     private static final ArrayDeque<String> seenEnchantOptionLogLineOrder = new ArrayDeque<>();
     private static final HashSet<String> seenEnchantOptionLogLineFingerprints = new HashSet<>();
+    /** Anti-doublon prestige (évite de relancer le chrono si Lunar change de fichier log). */
+    private static final ArrayDeque<String> seenPrestigeLogLineOrder = new ArrayDeque<>();
+    private static final HashSet<String> seenPrestigeLogLineFingerprints = new HashSet<>();
     /** État AFK (logs) : masque la section Reward à l’affichage et route les recaps vers AFK. */
     private static boolean afkRewardLoggingActive = false;
     private static final String AFK_LOG_ON_EXACT = "Vous êtes maintenant AFK";
@@ -176,6 +180,8 @@ public final class WorldHudOverlay {
     private static long lastLogPollWallMs = -999_000L;
     /** Fichier log choisi pour le HUD (run Minecraft ou Lunar multiver) ; invalidé en sortie de monde. */
     private static Path cachedHudLatestLogPath = null;
+    /** Fichier associé à {@link #logReadOffset} ; changement = reprise en fin de fichier sans relire l’historique. */
+    private static Path logReadOffsetPath = null;
     private static final long LOG_POLL_INTERVAL_MS = 40L;
     private static final long LOG_PATH_REFRESH_INTERVAL_MS = 1_500L;
     private static final int MAX_LOG_LINES_PER_POLL = 2_000;
@@ -195,6 +201,8 @@ public final class WorldHudOverlay {
     /** Dernière exécution du scan du sidebar (zones + concours farm, 1× / s). */
     private static long lastSidebarPollTick = Long.MIN_VALUE;
     private static boolean wasInGame = false;
+    /** Détecte transfert / déco vers un autre serveur quand l’événement Fabric DISCONNECT ne suffit pas. */
+    private static ClientPlayNetworkHandler lastPlayNetworkHandler = null;
     /**
      * Si on quitte le monde encore considéré AFK côté client, on réapplique l’état à la prochaine entrée en jeu
      * (reconnexion sans rejouer « maintenant AFK » dans la portion lue du log), sans limite de temps :
@@ -210,6 +218,14 @@ public final class WorldHudOverlay {
     private static final int RECONNECT_AFK_COMMAND_MIN_WAIT_TICKS = 40;
     /** Délai max avant d’envoyer {@code /afk} si le log AFK n’apparaît pas (ticks client). */
     private static final int RECONNECT_AFK_COMMAND_MAX_WAIT_TICKS = 100;
+    /** À chaque entrée monde / serveur : sonde le log (fin de fichier + nouvelles lignes). */
+    private static boolean afkWorldEntryDetectionPending = false;
+    private static boolean afkWorldEntryProbeActive = false;
+    private static boolean afkWorldEntryProbeResolved = false;
+    private static int afkWorldEntryProbeTicks = 0;
+    private static final int AFK_WORLD_ENTRY_PROBE_MAX_TICKS = 120;
+    private static final int AFK_WORLD_ENTRY_LOG_TAIL_MAX_LINES = 128;
+    private static final int AFK_WORLD_ENTRY_LOG_TAIL_BYTES = 96_000;
     /** Ignore le prochain envoi chat/commande déclenché par {@link #sendReconnectAfkCommand(MinecraftClient)}. */
     private static boolean suppressReconnectAfkSendClear = false;
     /** {@code true} seulement après {@link #restoreAfkLoggingStateAfterReconnect()} : l’activité locale sort de l’AFK côté HUD. */
@@ -218,13 +234,14 @@ public final class WorldHudOverlay {
     private static final double RECONNECT_AFK_MOVE_EPS_SQ = 0.12 * 0.12;
     private static final double RECONNECT_AFK_VERT_EPS = 0.22;
     private static boolean panelVisible = true;
-    /** Masque la carte HUD + sections + sous-menu après clic sur « Menu Minecraft ». */
+    /** Masque tous les panneaux du mod uniquement sur l’écran « Menu Minecraft (quitter, options…) ». */
     private static boolean hideHudForMinecraftMenu = false;
+    /** État du panneau paramètres avant ouverture du menu Minecraft (restauré à la sortie). */
+    private static boolean sectionsPanelOpenBeforeMinecraftMenu = false;
+    private static boolean savedSectionsPanelForMinecraftMenu = false;
 
     /** Panneau [U] : visibilité par section + position / taille. */
     private static boolean sectionsPanelOpen = false;
-    /** Ouvert automatiquement avec le menu Échap (fermé à la reprise si l’utilisateur ne l’avait pas déjà ouvert). */
-    private static boolean sectionsAutoOpenedForPause = false;
     private static int sectionsPosX = 120;
     private static int sectionsPosY = 18;
     private static int sectionsWidth = 252;
@@ -415,7 +432,9 @@ public final class WorldHudOverlay {
     private static final String AUTOFISH_LOG_TRIGGER_PREFIX = "Requested creation of existing team 'fish_team";
     private static boolean autoFishLogTriggerEnabled = false;
     /** Second clic « utiliser » reporté au tick suivant (comportement proche d’un double-clic). */
-    private static boolean autoFishSecondUseScheduled = false;
+  /** Second « utiliser » canne : délai après le premier (ms). */
+    private static final long AUTOFISH_SECOND_USE_DELAY_MS = 200L;
+    private static long autoFishSecondUseDueAtMs = 0L;
 
     /** Case « Informations » sous-menu (persistée, même aspect que AutoFish / autres sections). */
     private static boolean informationsRowEnabled = false;
@@ -702,6 +721,8 @@ public final class WorldHudOverlay {
     /** Si {@code true}, le chrono « Actuel » est figé sur {@link #prestigeFrozenElapsedMs}. */
     private static boolean prestigePaused = false;
     private static long prestigeFrozenElapsedMs = 0L;
+    /** Reprendre le chrono prestige à la reconnexion si la déco avait lieu en AFK. */
+    private static boolean prestigeAutoResumeOnAfkReconnect = false;
 
     static {
         STATS.put("money", new StatLine("Money", 0xFFFFCF33));
@@ -740,6 +761,8 @@ public final class WorldHudOverlay {
     public static void register() {
         HudRenderCallback.EVENT.register(WorldHudOverlay::render);
         ClientLifecycleEvents.CLIENT_STOPPING.register(WorldHudOverlay::onClientStopping);
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> onPlayConnectionDisconnect(client));
+        ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> onPlayConnectionJoin(client));
     }
 
     /**
@@ -750,12 +773,17 @@ public final class WorldHudOverlay {
         if (client == null) {
             return;
         }
-        if (client.currentScreen == null) {
-            hideHudForMinecraftMenu = false;
-        }
+        ensureLayoutLoaded(client);
+        syncModHudVisibilityAfterPauseMenus(client);
+        detectPlayConnectionChange(client);
         resetForNewSessionIfNeeded(client);
+        if (afkWorldEntryDetectionPending) {
+            beginAfkDetectionForWorldEntry(client);
+        }
+        tryRestorePendingAfkState(client);
         tickAutoFishScheduledSecondUse(client);
         updateEventsFromLogs(client);
+        tickAfkWorldEntryProbe(client);
         tickReconnectAfkCommand(client);
         tryClearReconnectRestoredAfkOnLocalActivity(client);
     }
@@ -772,7 +800,7 @@ public final class WorldHudOverlay {
         if (client.getWindow() == null) {
             return false;
         }
-        if (hideHudBehindVanillaMenu(client)) {
+        if (hideHudForMinecraftMenu) {
             return false;
         }
         double scaledW = client.getWindow().getScaledWidth();
@@ -809,9 +837,11 @@ public final class WorldHudOverlay {
             int er = ex + enchantWidth;
             int eb = ey + enchantHeight;
             int innerTop = ey + ENCHANT_HEADER_H + 2;
-            int contentTop = enchantPanelScrollContentTop(innerTop);
+            int innerLeft = ex + CARD_INSET;
+            int scrollTrackLeft = enchantPanelScrollTrackLeft(ex, enchantWidth);
+            int contentTop = enchantPanelScrollContentTop(client, innerTop, innerLeft, scrollTrackLeft);
             int innerBottom = eb - ENCHANT_PANEL_FOOTER_H;
-            if (mouseX >= ex + 1 && mouseX < er - 1 && mouseY >= contentTop && mouseY < innerBottom) {
+            if (mouseX >= ex + 1 && mouseX < scrollTrackLeft && mouseY >= contentTop && mouseY < innerBottom) {
                 int maxScroll = computeEnchantPanelScrollMax(client);
                 if (maxScroll > 0) {
                     enchantScrollPx = clamp(enchantScrollPx + step, 0, maxScroll);
@@ -894,7 +924,7 @@ public final class WorldHudOverlay {
         if (client == null || client.getWindow() == null) {
             return false;
         }
-        if (hideHudBehindVanillaMenu(client)) {
+        if (hideHudForMinecraftMenu) {
             return false;
         }
         if (sectionsDragging || sectionsResizing || logsDragging || logsResizing
@@ -992,7 +1022,7 @@ public final class WorldHudOverlay {
             if (fph <= 0) {
                 continue;
             }
-            int fw = hudSectionFloatWidth(i);
+            int fw = hudSectionDisplayWidth(client, i);
             int fx = hudSectionFloatX[i];
             int fy = hudSectionFloatY[i];
             if (mouseX >= fx && mouseX <= fx + fw && mouseY >= fy && mouseY <= fy + fph) {
@@ -1027,7 +1057,7 @@ public final class WorldHudOverlay {
             if (fph <= 0) {
                 continue;
             }
-            int fw = hudSectionFloatWidth(i);
+            int fw = hudSectionDisplayWidth(client, i);
             int fx = hudSectionFloatX[i];
             int fy = hudSectionFloatY[i];
             if (mouseX >= fx && mouseX <= fx + fw && mouseY >= fy && mouseY <= fy + fph) {
@@ -1091,17 +1121,19 @@ public final class WorldHudOverlay {
             mainCardScrollPx = 0;
             hudSectionDragIndex = -1;
             hudFloatResizeIndex = -1;
-            saveLayout(client);
+            persistAllMenuPositions(client);
         }
     }
 
     public static void togglePanelVisible() {
         panelVisible = !panelVisible;
+        MinecraftClient c = MinecraftClient.getInstance();
+        if (c != null) {
+            persistAllMenuPositions(c);
+        }
         if (!panelVisible) {
-            MinecraftClient c = MinecraftClient.getInstance();
             if (editMode && c != null) {
                 editMode = false;
-                saveLayout(c);
             } else {
                 editMode = false;
             }
@@ -1120,17 +1152,13 @@ public final class WorldHudOverlay {
         return client.options.hudHidden && client.currentScreen == null && client.world != null;
     }
 
-    /**
-     * Masque la carte / interactions Feather derrière le menu Minecraft vanilla (ou après « Menu Minecraft »),
-     * sauf si le panneau Paramètres est ouvert — nécessaire sous Lunar (pause vanilla) pour garder accès à Informations et aux réglages.
-     */
-    private static boolean hideHudBehindVanillaMenu(MinecraftClient client) {
-        return (hideHudForMinecraftMenu || client.currentScreen instanceof GameMenuScreen) && !sectionsPanelOpen;
-    }
-
     private static void render(DrawContext context, RenderTickCounter tickCounter) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client == null) {
+            return;
+        }
+        if (hideHudForMinecraftMenu) {
+            cancelHudPointerInteractionsOnly();
             return;
         }
         ensureLayoutLoaded(client);
@@ -1139,10 +1167,7 @@ public final class WorldHudOverlay {
             fitSectionsPanelToContent(client);
         }
         updateFromSidebarScoreboard(client);
-        // Après clic sur « Menu Minecraft », on masque intégralement la carte HUD + sections
-        // + sous-menu, même si l’utilisateur navigue vers Options ou d’autres écrans vanilla.
-        // L’écran Échap Feather n’active pas ce flag : le HUD reste visible derrière son bouton.
-        boolean hideForMinecraftMenu = hideHudBehindVanillaMenu(client);
+        boolean hideForMinecraftMenu = hideHudForMinecraftMenu;
         if (!hideForMinecraftMenu) {
             if (panelVisible) {
                 int mMax = mainCardScrollMax(client, posY, posY + cardHeight, cardWidth);
@@ -1244,44 +1269,57 @@ public final class WorldHudOverlay {
         sectionsPosX = clamp(sectionsPosX, 2, Math.max(2, sw - sectionsWidth - 2));
     }
 
+    /** Activé par le bouton « Menu Minecraft (quitter, options…) » sur {@link FeatherPauseScreen}. */
     public static void setHideHudForMinecraftMenu(boolean hide) {
+        if (hideHudForMinecraftMenu == hide) {
+            return;
+        }
         hideHudForMinecraftMenu = hide;
+        if (hide) {
+            sectionsPanelOpenBeforeMinecraftMenu = sectionsPanelOpen;
+            savedSectionsPanelForMinecraftMenu = true;
+            cancelHudPointerInteractionsOnly();
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (client != null && editMode) {
+                editMode = false;
+                saveLayout(client);
+            }
+        } else {
+            restoreModPanelsAfterMinecraftMenu(MinecraftClient.getInstance());
+        }
+    }
+
+    /** Écran ouvert via le bouton « Menu Minecraft (quitter, options…) ». */
+    public static boolean isMinecraftGameMenuScreenOpen(MinecraftClient client) {
+        return client != null && client.currentScreen instanceof FeatherGameMenuScreen;
     }
 
     /**
-     * Ouverture de l’écran Échap Feather : on ne touche ni à la carte HUD, ni au sous-menu
-     * paramètres, ni au mode édition. Seul le bouton « Menu Minecraft » s’affiche ; tout le
-     * reste garde l’état que l’utilisateur avait avant l’Échap.
+     * Réaffiche tous les panneaux quand on revient au menu Feather (bouton visible) ou en jeu ;
+     * reste masqué sur le menu Minecraft et ses sous-écrans (Options, etc.).
      */
-    public static void onFeatherPauseOpened(MinecraftClient client) {
-        if (client == null || client.world == null) {
+    private static void syncModHudVisibilityAfterPauseMenus(MinecraftClient client) {
+        if (client == null || !hideHudForMinecraftMenu) {
             return;
         }
-        hideHudForMinecraftMenu = false;
+        Screen screen = client.currentScreen;
+        if (screen instanceof FeatherGameMenuScreen) {
+            return;
+        }
+        if (screen == null || screen instanceof FeatherPauseScreen) {
+            onGameMenuClosed(client);
+        }
     }
 
-    /**
-     * Ouverture du menu Minecraft « classique » (depuis le bouton du menu Feather) : on coupe
-     * le mode édition pour ne pas attraper les clics destinés aux boutons vanilla (Options, etc.),
-     * et on sauvegarde la disposition courante. Le sous-menu paramètres garde son état.
-     */
-    public static void onVanillaGameMenuOpened(MinecraftClient client) {
-        if (client == null || client.world == null) {
-            return;
-        }
-        hideHudForMinecraftMenu = true;
-        if (editMode) {
-            editMode = false;
-            saveLayout(client);
-        }
-        // HUD masqué pendant le menu Minecraft : on remet toutes les interactions à zéro pour
-        // qu’on ne retrouve pas un drag / resize « bloqué » au retour en jeu.
+    private static void cancelHudPointerInteractionsOnly() {
         dragging = false;
         resizing = false;
         hudSectionDragIndex = -1;
         hudFloatResizeIndex = -1;
         sectionsDragging = false;
         sectionsResizing = false;
+        logsDragging = false;
+        logsResizing = false;
         enchantDragging = false;
         enchantResizing = false;
         enchantOptionsDragging = false;
@@ -1294,28 +1332,16 @@ public final class WorldHudOverlay {
         captureBindingIndex = KEY_CAPTURE_NONE;
     }
 
-    /** Conservé pour compatibilité ; route vers la variante Feather (comportement historique). */
-    public static void onGameMenuOpened(MinecraftClient client) {
-        onFeatherPauseOpened(client);
+    private static void restoreModPanelsAfterMinecraftMenu(MinecraftClient client) {
+        if (savedSectionsPanelForMinecraftMenu) {
+            sectionsPanelOpen = sectionsPanelOpenBeforeMinecraftMenu;
+            savedSectionsPanelForMinecraftMenu = false;
+        }
     }
 
     public static void onGameMenuClosed(MinecraftClient client) {
         hideHudForMinecraftMenu = false;
-        if (sectionsAutoOpenedForPause && sectionsPanelOpen) {
-            sectionsPanelOpen = false;
-            captureBindingIndex = KEY_CAPTURE_NONE;
-            sectionsDragging = false;
-            sectionsResizing = false;
-            if (client != null) {
-                saveLayout(client);
-            }
-        }
-        sectionsAutoOpenedForPause = false;
-    }
-
-    private static boolean isGameMenuPauseOpen(MinecraftClient client) {
-        return client != null && (client.currentScreen instanceof GameMenuScreen
-                || client.currentScreen instanceof FeatherPauseScreen);
+        restoreModPanelsAfterMinecraftMenu(client);
     }
 
     /**
@@ -1419,7 +1445,7 @@ public final class WorldHudOverlay {
             enchantPosY = Integer.parseInt(p.getProperty("enchant.y", String.valueOf(enchantPosY)));
             enchantWidth = Integer.parseInt(p.getProperty("enchant.width", String.valueOf(enchantWidth)));
             enchantHeight = Integer.parseInt(p.getProperty("enchant.height", String.valueOf(enchantHeight)));
-            enchantWidth = Math.max(MIN_ENCHANT_PANEL_W, enchantWidth);
+            enchantWidth = Math.max(minEnchantPanelWidth(client), enchantWidth);
             enchantHeight = Math.max(MIN_ENCHANT_PANEL_H, enchantHeight);
             enchantOptionsPosX = Integer.parseInt(p.getProperty("enchant.options.x", String.valueOf(enchantOptionsPosX)));
             enchantOptionsPosY = Integer.parseInt(p.getProperty("enchant.options.y", String.valueOf(enchantOptionsPosY)));
@@ -1447,6 +1473,10 @@ public final class WorldHudOverlay {
             afkDisplayZone = RewardDisplayZone.fromConfig(p.getProperty("section.afk_zone"));
             autoFishLogTriggerEnabled = Boolean.parseBoolean(p.getProperty("feature.autofish_log_trigger", "false"));
             informationsRowEnabled = Boolean.parseBoolean(p.getProperty("feature.informations_row", "false"));
+            panelVisible = Boolean.parseBoolean(p.getProperty("layout.panel_visible", "true"));
+            enchantMenuEnabled = Boolean.parseBoolean(p.getProperty("layout.enchant_menu", "false"));
+            enchantOptionsMenuEnabled = Boolean.parseBoolean(p.getProperty("layout.enchant_options_menu", "false"));
+            logsMenuEnabled = Boolean.parseBoolean(p.getProperty("layout.logs_menu", "false"));
             FeatherWorldMenuClient.setToggleHudKeyCode(Integer.parseInt(
                     p.getProperty("key.edit", String.valueOf(FeatherWorldMenuClient.getToggleHudKeyCode()))));
             FeatherWorldMenuClient.setToggleVisibleKeyCode(Integer.parseInt(
@@ -1473,6 +1503,9 @@ public final class WorldHudOverlay {
             sectionsWidth = Math.max(minSectionsPanelWidth(client), sectionsWidth);
             reloadLogSessionArchiveFrom(p);
             loadPotionSlotsFrom(p);
+            loadPrestigeStateFrom(p);
+            reapplyAfkLoggingOnNextWorldEntry = Boolean.parseBoolean(p.getProperty("session.reapply_afk", "false"));
+            prestigeAutoResumeOnAfkReconnect = Boolean.parseBoolean(p.getProperty("prestige.resume_on_afk_reconnect", "false"));
         } catch (Exception ignored) {
         }
         hudViewportBaseline(client);
@@ -1520,7 +1553,8 @@ public final class WorldHudOverlay {
         logsHeight = Math.max(MIN_LOGS_PANEL_H, clamp((int) Math.round(logsHeight * ry), MIN_LOGS_PANEL_H, Math.max(MIN_LOGS_PANEL_H, sh - 4)));
         logsPosX = clamp((int) Math.round(logsPosX * rx), 2, Math.max(2, sw - logsWidth - 2));
         logsPosY = clamp((int) Math.round(logsPosY * ry), 2, Math.max(2, sh - logsHeight - 2));
-        enchantWidth = Math.max(MIN_ENCHANT_PANEL_W, clamp((int) Math.round(enchantWidth * rx), MIN_ENCHANT_PANEL_W, Math.max(MIN_ENCHANT_PANEL_W, sw - 4)));
+        int minEnchantW = minEnchantPanelWidth(client);
+        enchantWidth = Math.max(minEnchantW, clamp((int) Math.round(enchantWidth * rx), minEnchantW, Math.max(minEnchantW, sw - 4)));
         enchantHeight = Math.max(MIN_ENCHANT_PANEL_H, clamp((int) Math.round(enchantHeight * ry), MIN_ENCHANT_PANEL_H, Math.max(MIN_ENCHANT_PANEL_H, sh - 4)));
         enchantPosX = clamp((int) Math.round(enchantPosX * rx), 2, Math.max(2, sw - enchantWidth - 2));
         enchantPosY = clamp((int) Math.round(enchantPosY * ry), 2, Math.max(2, sh - enchantHeight - 2));
@@ -1592,6 +1626,10 @@ public final class WorldHudOverlay {
             p.setProperty("section.afk_zone", afkDisplayZone.name());
             p.setProperty("feature.autofish_log_trigger", String.valueOf(autoFishLogTriggerEnabled));
             p.setProperty("feature.informations_row", String.valueOf(informationsRowEnabled));
+            p.setProperty("layout.panel_visible", String.valueOf(panelVisible));
+            p.setProperty("layout.enchant_menu", String.valueOf(enchantMenuEnabled));
+            p.setProperty("layout.enchant_options_menu", String.valueOf(enchantOptionsMenuEnabled));
+            p.setProperty("layout.logs_menu", String.valueOf(logsMenuEnabled));
             p.setProperty("key.edit", String.valueOf(FeatherWorldMenuClient.getToggleHudKeyCode()));
             p.setProperty("key.hide", String.valueOf(FeatherWorldMenuClient.getToggleVisibleKeyCode()));
             p.setProperty("key.params", String.valueOf(FeatherWorldMenuClient.getToggleSectionsKeyCode()));
@@ -1605,6 +1643,9 @@ public final class WorldHudOverlay {
                 p.setProperty("section." + i + ".fpad", String.valueOf(hudSectionFloatPadBottom[i]));
             }
             persistLogSessionArchiveTo(p);
+            savePrestigeStateTo(p);
+            p.setProperty("session.reapply_afk", String.valueOf(reapplyAfkLoggingOnNextWorldEntry));
+            p.setProperty("prestige.resume_on_afk_reconnect", String.valueOf(prestigeAutoResumeOnAfkReconnect));
             p.store(Files.newBufferedWriter(path, StandardCharsets.UTF_8), "Feather World Menu layout");
         } catch (IOException ignored) {
         }
@@ -1658,12 +1699,7 @@ public final class WorldHudOverlay {
             }
             case 4 -> 26 + SECTION_BLOCK_TAIL_PAD;
             case 5 -> (narrowStats ? 44 : 26) + SECTION_BLOCK_TAIL_PAD;
-            case 6 -> {
-                int n = POTION_SLOTS.size();
-                // Section Potion : titre + une ligne par slot ; la phrase détectée n’est plus affichée.
-                int base = 2 + 8 + n * (10 + 1);
-                yield base;
-            }
+            case 6 -> potionSectionDockedHeight(client);
             default -> 0;
         };
     }
@@ -1749,7 +1785,7 @@ public final class WorldHudOverlay {
             mainCardFooterBtnMouseDownLast = false;
             return;
         }
-        if (!panelVisible || hideHudBehindVanillaMenu(client) || shouldHideHudForF1Only(client)) {
+        if (!panelVisible || hideHudForMinecraftMenu || shouldHideHudForF1Only(client)) {
             mainCardFooterBtnMouseDownLast = false;
             return;
         }
@@ -1983,7 +2019,7 @@ public final class WorldHudOverlay {
     private static void clampHudFloatSection(MinecraftClient client, int idx) {
         int sw = client.getWindow().getScaledWidth();
         int sh = client.getWindow().getScaledHeight();
-        int fw = hudSectionFloatWidth(idx);
+        int fw = hudSectionDisplayWidth(client, idx);
         int fh = getHudFloatPanelHeight(client, idx);
         hudSectionFloatX[idx] = clamp(hudSectionFloatX[idx], 2, Math.max(2, sw - fw - 2));
         hudSectionFloatY[idx] = clamp(hudSectionFloatY[idx], 2, Math.max(2, sh - fh - 2));
@@ -2076,7 +2112,7 @@ public final class WorldHudOverlay {
             resizeStartWidth = cardWidth;
             resizeStartHeight = cardHeight;
         } else if (!mouseDownLastFrame && mouseDown) {
-            int floatClose = editMode ? pickFloatingSectionCloseButton(mouseX, mouseY) : -1;
+            int floatClose = editMode ? pickFloatingSectionCloseButton(client, mouseX, mouseY) : -1;
             if (floatClose >= 0) {
                 hudSectionFloating[floatClose] = false;
                 clampHudFloatSection(client, floatClose);
@@ -2091,7 +2127,7 @@ public final class WorldHudOverlay {
                     hudFloatResizeIndex = floatRes;
                     hudFloatResizeStartMouseX = mouseX;
                     hudFloatResizeStartMouseY = mouseY;
-                    hudFloatResizeStartW = hudSectionFloatWidth(floatRes);
+                    hudFloatResizeStartW = hudSectionDisplayWidth(client, floatRes);
                     hudFloatResizeStartTotalH = getHudFloatPanelHeight(client, floatRes);
                 } else {
                     int picked = pickHudSectionForEditDrag(client, mouseX, mouseY);
@@ -2136,7 +2172,7 @@ public final class WorldHudOverlay {
     }
 
     private static boolean mouseInFloatingResizeHandle(MinecraftClient client, int i, int mouseX, int mouseY) {
-        int fw = hudSectionFloatWidth(i);
+        int fw = hudSectionDisplayWidth(client, i);
         int fh = getHudFloatPanelHeight(client, i);
         int fx = hudSectionFloatX[i];
         int fy = hudSectionFloatY[i];
@@ -2145,22 +2181,22 @@ public final class WorldHudOverlay {
         return mouseX >= hLeft && mouseX <= fx + fw && mouseY >= hTop && mouseY <= fy + fh;
     }
 
-    private static int floatingSectionCloseLeft(int idx) {
-        return hudSectionFloatX[idx] + hudSectionFloatWidth(idx) - FLOAT_CLOSE_BTN_INSET - FLOAT_CLOSE_BTN_SIZE;
+    private static int floatingSectionCloseLeft(MinecraftClient client, int idx) {
+        return hudSectionFloatX[idx] + hudSectionDisplayWidth(client, idx) - FLOAT_CLOSE_BTN_INSET - FLOAT_CLOSE_BTN_SIZE;
     }
 
     private static int floatingSectionCloseTop(int idx) {
         return hudSectionFloatY[idx] + FLOAT_CLOSE_BTN_INSET;
     }
 
-    private static boolean mouseInFloatingCloseButton(int i, int mouseX, int mouseY) {
-        int left = floatingSectionCloseLeft(i);
+    private static boolean mouseInFloatingCloseButton(MinecraftClient client, int i, int mouseX, int mouseY) {
+        int left = floatingSectionCloseLeft(client, i);
         int top = floatingSectionCloseTop(i);
         return mouseX >= left && mouseX < left + FLOAT_CLOSE_BTN_SIZE
                 && mouseY >= top && mouseY < top + FLOAT_CLOSE_BTN_SIZE;
     }
 
-    private static int pickFloatingSectionCloseButton(int mouseX, int mouseY) {
+    private static int pickFloatingSectionCloseButton(MinecraftClient client, int mouseX, int mouseY) {
         if (mouseOverHudSectionBlockingOverlays(mouseX, mouseY)) {
             return -1;
         }
@@ -2168,7 +2204,7 @@ public final class WorldHudOverlay {
             if (!hudSectionShown(i) || !hudSectionFloating[i]) {
                 continue;
             }
-            if (mouseInFloatingCloseButton(i, mouseX, mouseY)) {
+            if (mouseInFloatingCloseButton(client, i, mouseX, mouseY)) {
                 return i;
             }
         }
@@ -2183,7 +2219,7 @@ public final class WorldHudOverlay {
             if (!hudSectionShown(i) || !hudSectionFloating[i]) {
                 continue;
             }
-            if (mouseInFloatingCloseButton(i, mouseX, mouseY)) {
+            if (mouseInFloatingCloseButton(client, i, mouseX, mouseY)) {
                 continue;
             }
             if (mouseInFloatingResizeHandle(client, i, mouseX, mouseY)) {
@@ -2202,13 +2238,13 @@ public final class WorldHudOverlay {
             if (!hudSectionShown(i) || !hudSectionFloating[i]) {
                 continue;
             }
-            if (mouseInFloatingCloseButton(i, mouseX, mouseY)) {
+            if (mouseInFloatingCloseButton(client, i, mouseX, mouseY)) {
                 continue;
             }
             if (mouseInFloatingResizeHandle(client, i, mouseX, mouseY)) {
                 continue;
             }
-            int fw = hudSectionFloatWidth(i);
+            int fw = hudSectionDisplayWidth(client, i);
             int fph = getHudFloatPanelHeight(client, i);
             if (fph <= 0) {
                 continue;
@@ -2467,6 +2503,7 @@ public final class WorldHudOverlay {
         int er = ex + ew;
         int innerTop = ey + ENCHANT_HEADER_H + 2;
         int innerLeft = ex + CARD_INSET;
+        int scrollTrackLeft = enchantPanelScrollTrackLeft(ex, ew);
 
         boolean inDragBar = mouseX >= ex && mouseX <= er && mouseY >= ey && mouseY < ey + ENCHANT_HEADER_H;
         boolean inResizeHandle = enchantResizeHandleHit(mouseX, mouseY) && !mainHudCardResizeHandleHit(mouseX, mouseY);
@@ -2490,7 +2527,7 @@ public final class WorldHudOverlay {
             } else if (!inFooterStrip) {
                 boolean hitTopBtn = false;
                 if (isEnchantSectionVisibleForCurrentWorld()) {
-                    EnchantOptionsTopBtnRowLayout topRow = layoutEnchantTopButtonRow(client, innerLeft, innerTop);
+                    EnchantOptionsTopBtnRowLayout topRow = layoutEnchantTopButtonRow(client, innerLeft, innerTop, scrollTrackLeft);
                     if (mouseX >= topRow.cumuls().left() && mouseX < topRow.cumuls().right()
                             && mouseY >= topRow.cumuls().top() && mouseY < topRow.cumuls().bottom()) {
                         enchantShowCumulativeSums = !enchantShowCumulativeSums;
@@ -2500,6 +2537,10 @@ public final class WorldHudOverlay {
                             && mouseY >= topRow.topSort().top() && mouseY < topRow.topSort().bottom()) {
                         enchantPanelSortByCumuls = !enchantPanelSortByCumuls;
                         saveLayout(client);
+                        hitTopBtn = true;
+                    } else if (mouseX >= topRow.reset().left() && mouseX < topRow.reset().right()
+                            && mouseY >= topRow.reset().top() && mouseY < topRow.reset().bottom()) {
+                        resetEnchantPanelCounters();
                         hitTopBtn = true;
                     }
                 }
@@ -2529,7 +2570,7 @@ public final class WorldHudOverlay {
         if (enchantResizing) {
             int dx = mouseX - enchantResizeStartMouseX;
             int dy = mouseY - enchantResizeStartMouseY;
-            enchantWidth = Math.max(MIN_ENCHANT_PANEL_W, enchantResizeStartW + dx);
+            enchantWidth = Math.max(minEnchantPanelWidth(client), enchantResizeStartW + dx);
             enchantHeight = Math.max(MIN_ENCHANT_PANEL_H, enchantResizeStartH + dy);
         }
     }
@@ -2711,12 +2752,12 @@ public final class WorldHudOverlay {
         context.drawText(client.textRenderer, Text.literal(titleShown), ex + CARD_INSET, ey + 4, 0xFFF3E5F5, false);
 
         int innerTop = ey + ENCHANT_HEADER_H + 2;
-        int contentTop = enchantPanelScrollContentTop(innerTop);
         int innerBottom = eb - ENCHANT_PANEL_FOOTER_H;
         int innerLeft = ex + CARD_INSET;
-        int scrollTrackLeft = er - SCROLLBAR_TRACK_W - SCROLLBAR_PAD;
-        drawEnchantTopButtonRow(context, client, innerLeft, innerTop);
-        context.enableScissor(ex + 1, contentTop, scrollTrackLeft, innerBottom);
+        int scrollTrackLeft = enchantPanelScrollTrackLeft(ex, ew);
+        context.enableScissor(ex + 1, innerTop, scrollTrackLeft, innerBottom);
+        drawEnchantTopButtonRow(context, client, innerLeft, innerTop, scrollTrackLeft);
+        int contentTop = enchantPanelScrollContentTop(client, innerTop, innerLeft, scrollTrackLeft);
         try {
             context.getMatrices().pushMatrix();
             context.getMatrices().translate(0f, (float) -enchantScrollPx);
@@ -2795,14 +2836,202 @@ public final class WorldHudOverlay {
     }
 
     private static void onClientStopping(MinecraftClient client) {
-        autoFishSecondUseScheduled = false;
+        autoFishSecondUseDueAtMs = 0L;
         resetEnchantOptionLogSums();
         if (client != null) {
-            saveLayout(client);
+            onPlaySessionSuspend(client);
             if (client.player != null && client.world != null) {
                 pushLogSessionArchive(client);
             }
         }
+    }
+
+    /** Déconnexion / transfert vers un autre serveur : pause prestige en premier, puis mémorise l’AFK. */
+    private static void onPlayConnectionDisconnect(MinecraftClient client) {
+        onPlaySessionSuspend(client);
+    }
+
+    /** Entrée sur un serveur (reconnexion, transfert Bungee, etc.). */
+    private static void onPlayConnectionJoin(MinecraftClient client) {
+        if (client == null) {
+            return;
+        }
+        ensureLayoutLoaded(client);
+        lastPlayNetworkHandler = client.getNetworkHandler();
+        if (prestigeRunActive && (prestigeAutoResumeOnAfkReconnect || reapplyAfkLoggingOnNextWorldEntry) && !prestigePaused) {
+            freezePrestigeOnSessionSuspend();
+            persistAllMenuPositions(client);
+        }
+        scheduleAfkDetectionForWorldEntry();
+        tryRestorePendingAfkState(client);
+    }
+
+    /** Planifie une détection AFK (JOIN serveur, même si le joueur est déjà chargé). */
+    private static void scheduleAfkDetectionForWorldEntry() {
+        afkWorldEntryDetectionPending = true;
+    }
+
+    /**
+     * À chaque monde / serveur : relit la fin du log, puis surveille les nouvelles lignes AFK.
+     */
+    private static void beginAfkDetectionForWorldEntry(MinecraftClient client) {
+        if (client == null || client.player == null || client.world == null) {
+            scheduleAfkDetectionForWorldEntry();
+            return;
+        }
+        afkWorldEntryDetectionPending = false;
+        afkWorldEntryProbeActive = true;
+        afkWorldEntryProbeResolved = false;
+        afkWorldEntryProbeTicks = 0;
+        scanRecentLogTailForAfkState(client);
+        seekLogReadToEnd(client);
+        tryRestorePendingAfkState(client);
+    }
+
+    private static void seekLogReadToEnd(MinecraftClient client) {
+        try {
+            Path lp = resolveLatestLogPath(client);
+            logReadOffsetPath = lp;
+            logReadOffset = Files.exists(lp) ? Files.size(lp) : 0L;
+        } catch (IOException e) {
+            logReadOffsetPath = null;
+            logReadOffset = 0L;
+        }
+    }
+
+    /**
+     * Dernières lignes du log : dernière bascule AFK ON/OFF (évite de relire tout l’historique).
+     */
+    private static void scanRecentLogTailForAfkState(MinecraftClient client) {
+        if (client == null) {
+            return;
+        }
+        Path logPath = resolveLatestLogPath(client);
+        if (!Files.isReadable(logPath)) {
+            return;
+        }
+        try {
+            List<String> tailLines = readLastLogLines(logPath, AFK_WORLD_ENTRY_LOG_TAIL_MAX_LINES);
+            int lastOnIdx = -1;
+            int lastOffIdx = -1;
+            for (int i = 0; i < tailLines.size(); i++) {
+                String line = tailLines.get(i);
+                String s = stripLogPrefix(line);
+                if (s.isBlank()) {
+                    s = stripForRecapFarm(line);
+                }
+                String t = s.trim();
+                String norm = normalizeAsciiLower(t);
+                if (AFK_ON_PATTERN.matcher(norm).find() || t.equals(AFK_LOG_ON_EXACT)) {
+                    lastOnIdx = i;
+                } else if (AFK_OFF_PATTERN.matcher(norm).find() || t.equals(AFK_LOG_OFF_EXACT)) {
+                    lastOffIdx = i;
+                }
+            }
+            if (lastOnIdx > lastOffIdx) {
+                parseAfkStateFromLog(tailLines.get(lastOnIdx));
+                afkWorldEntryProbeResolved = true;
+            } else if (lastOffIdx > lastOnIdx && afkRewardLoggingActive) {
+                clearAfkLoggingClientStateAsIfLeft();
+                afkWorldEntryProbeResolved = true;
+            }
+        } catch (IOException ignored) {
+        }
+    }
+
+    private static List<String> readLastLogLines(Path path, int maxLines) throws IOException {
+        ArrayList<String> lines = new ArrayList<>(Math.min(maxLines, 64));
+        try (RandomAccessFile file = new RandomAccessFile(path.toFile(), "r")) {
+            long length = file.length();
+            if (length <= 0L) {
+                return lines;
+            }
+            long start = Math.max(0L, length - AFK_WORLD_ENTRY_LOG_TAIL_BYTES);
+            file.seek(start);
+            if (start > 0L) {
+                readUtf8Line(file);
+            }
+            String line;
+            while ((line = readUtf8Line(file)) != null) {
+                lines.add(line);
+                if (lines.size() > maxLines) {
+                    lines.remove(0);
+                }
+            }
+        }
+        return lines;
+    }
+
+    private static void tickAfkWorldEntryProbe(MinecraftClient client) {
+        if (!afkWorldEntryProbeActive || client == null || client.player == null || client.world == null) {
+            return;
+        }
+        afkWorldEntryProbeTicks++;
+        if (afkWorldEntryProbeResolved || afkWorldEntryProbeTicks >= AFK_WORLD_ENTRY_PROBE_MAX_TICKS) {
+            afkWorldEntryProbeActive = false;
+            if (!afkWorldEntryProbeResolved && reapplyAfkLoggingOnNextWorldEntry && !afkRewardLoggingActive) {
+                restoreAfkLoggingStateAfterReconnect();
+            }
+        }
+    }
+
+    /**
+     * Transfert inter-serveurs (souvent sans {@code player == null}) : le handler réseau change ou disparaît.
+     */
+    private static void detectPlayConnectionChange(MinecraftClient client) {
+        if (client == null) {
+            return;
+        }
+        ClientPlayNetworkHandler handler = client.getNetworkHandler();
+        ClientPlayNetworkHandler prev = lastPlayNetworkHandler;
+        if (prev != null && prev != handler) {
+            onPlaySessionSuspend(client);
+        }
+        lastPlayNetworkHandler = handler;
+    }
+
+    private static void onPlaySessionSuspend(MinecraftClient client) {
+        if (client == null) {
+            return;
+        }
+        freezePrestigeOnSessionSuspend();
+        boolean wasAfk = afkRewardLoggingActive || reapplyAfkLoggingOnNextWorldEntry;
+        prepareAfkReconnectFlags(wasAfk);
+        persistAllMenuPositions(client);
+    }
+
+    private static void prepareAfkReconnectFlags(boolean wasAfk) {
+        if (wasAfk) {
+            reapplyAfkLoggingOnNextWorldEntry = true;
+            if (prestigeRunActive) {
+                prestigeAutoResumeOnAfkReconnect = true;
+            }
+        } else {
+            reapplyAfkLoggingOnNextWorldEntry = false;
+            prestigeAutoResumeOnAfkReconnect = false;
+        }
+    }
+
+    /**
+     * Réactive l’AFK côté client (et envoie {@code /afk} si besoin) après déco serveur ou fermeture du jeu.
+     */
+    private static void tryRestorePendingAfkState(MinecraftClient client) {
+        if (client == null || client.player == null || client.world == null) {
+            return;
+        }
+        if (!reapplyAfkLoggingOnNextWorldEntry || afkRewardLoggingActive) {
+            return;
+        }
+        reapplyAfkLoggingOnNextWorldEntry = false;
+        restoreAfkLoggingStateAfterReconnect();
+    }
+
+    /** Sauvegarde toutes les positions / tailles des panneaux (fermeture du jeu, déco, fin d’édition). */
+    private static void persistAllMenuPositions(MinecraftClient client) {
+        if (client == null) {
+            return;
+        }
+        saveLayout(client);
     }
 
     /** Capture Reward + AFK (même structure par monde que le HUD) + durée Session ; FIFO 5 entrées ; session ≥ 20min. */
@@ -3354,13 +3583,18 @@ public final class WorldHudOverlay {
     private static void resetForNewSessionIfNeeded(MinecraftClient client) {
         boolean inGame = client.player != null && client.world != null;
         if (!inGame && wasInGame) {
-            boolean wasAfkBeforeDisconnect = afkRewardLoggingActive;
+            onPlaySessionSuspend(client);
+            boolean wasAfkBeforeDisconnect = afkRewardLoggingActive || reapplyAfkLoggingOnNextWorldEntry;
             reconnectAfkCommandWatchActive = false;
             reconnectAfkCommandWatchTicks = 0;
+            prepareAfkReconnectFlags(wasAfkBeforeDisconnect);
             pushLogSessionArchive(client);
-            saveLayout(client);
             clearSessionTracking();
             reapplyAfkLoggingOnNextWorldEntry = wasAfkBeforeDisconnect;
+            if (wasAfkBeforeDisconnect && prestigeRunActive) {
+                prestigeAutoResumeOnAfkReconnect = true;
+            }
+            persistAllMenuPositions(client);
             lastHudScaledW = -1;
             lastHudScaledH = -1;
         }
@@ -3368,16 +3602,7 @@ public final class WorldHudOverlay {
             lastHudScaledW = -1;
             lastHudScaledH = -1;
             startTimeMs = System.currentTimeMillis();
-            try {
-                Path lp = resolveLatestLogPath(client);
-                logReadOffset = Files.exists(lp) ? Files.size(lp) : 0L;
-            } catch (IOException e) {
-                logReadOffset = 0L;
-            }
-            if (reapplyAfkLoggingOnNextWorldEntry) {
-                reapplyAfkLoggingOnNextWorldEntry = false;
-                restoreAfkLoggingStateAfterReconnect();
-            }
+            beginAfkDetectionForWorldEntry(client);
         }
         wasInGame = inGame;
     }
@@ -3400,6 +3625,50 @@ public final class WorldHudOverlay {
             reconnectAfkActivityBaseline = c.player.getPos();
         } else {
             reconnectAfkActivityBaseline = null;
+        }
+        if (prestigeRunActive && prestigePaused) {
+            prestigeAutoResumeOnAfkReconnect = true;
+        }
+        if (c != null) {
+            saveLayout(c);
+        }
+    }
+
+    /** Reprend le chrono prestige quand l’AFK est confirmé après reconnexion / redém. */
+    private static void resumePrestigeAfterAfkReconnect() {
+        if (!prestigeRunActive) {
+            prestigeAutoResumeOnAfkReconnect = false;
+            return;
+        }
+        if (!prestigeAutoResumeOnAfkReconnect && !prestigePaused) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        long elapsed = prestigePaused
+                ? Math.max(0L, prestigeFrozenElapsedMs)
+                : Math.max(0L, now - prestigeStartMs);
+        prestigeStartMs = now - elapsed;
+        prestigePaused = false;
+        prestigeFrozenElapsedMs = 0L;
+        prestigeAutoResumeOnAfkReconnect = false;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client != null) {
+            saveLayout(client);
+        }
+    }
+
+    /** Reprend le chrono prestige si en pause (bouton / touche). */
+    private static void resumePrestigeIfPaused() {
+        if (!prestigeRunActive || !prestigePaused) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        prestigeStartMs = now - Math.max(0L, prestigeFrozenElapsedMs);
+        prestigePaused = false;
+        prestigeAutoResumeOnAfkReconnect = false;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client != null) {
+            saveLayout(client);
         }
     }
 
@@ -3465,6 +3734,8 @@ public final class WorldHudOverlay {
     private static void clearAfkLoggingClientStateAsIfLeft() {
         afkAwaitingLocalActivityClearAfterReconnect = false;
         reconnectAfkActivityBaseline = null;
+        prestigeAutoResumeOnAfkReconnect = false;
+        reapplyAfkLoggingOnNextWorldEntry = false;
         if (!afkRewardLoggingActive) {
             return;
         }
@@ -3513,22 +3784,18 @@ public final class WorldHudOverlay {
         latestLogMissingWarned = false;
         latestLogReadErrorWarned = false;
         cachedHudLatestLogPath = null;
+        logReadOffsetPath = null;
         lastLogPathRefreshWallMs = -999_000L;
         clearSeenRewardLineFingerprints();
         clearSeenAfkRewardLineFingerprints();
         clearSeenEnchantOptionLogLineFingerprints();
+        clearSeenPrestigeLogLineFingerprints();
         afkRewardLoggingActive = false;
         rewardFarmSessionByZone.clear();
         afkFarmSessionByZone.clear();
         afkAutoShownActive = false;
-        reapplyAfkLoggingOnNextWorldEntry = false;
         afkAwaitingLocalActivityClearAfterReconnect = false;
         reconnectAfkActivityBaseline = null;
-        prestigeRunActive = false;
-        prestigeStartMs = 0L;
-        prestigeDernierDurationMs = -1L;
-        prestigePaused = false;
-        prestigeFrozenElapsedMs = 0L;
     }
 
     private static void clearSeenRewardLineFingerprints() {
@@ -3544,6 +3811,11 @@ public final class WorldHudOverlay {
     private static void clearSeenEnchantOptionLogLineFingerprints() {
         seenEnchantOptionLogLineOrder.clear();
         seenEnchantOptionLogLineFingerprints.clear();
+    }
+
+    private static void clearSeenPrestigeLogLineFingerprints() {
+        seenPrestigeLogLineOrder.clear();
+        seenPrestigeLogLineFingerprints.clear();
     }
 
     /** @return {@code false} si cette ligne a déjà été comptée pour la section Reward. */
@@ -3611,6 +3883,35 @@ public final class WorldHudOverlay {
         }
     }
 
+    /** Remet à zéro procs + cumuls Enchant du monde courant uniquement (Lac, Mine ou Ferme). */
+    public static void resetEnchantPanelCounters() {
+        EnchantOptionSet optionSet = currentEnchantOptionSet();
+        if (optionSet == null) {
+            return;
+        }
+        Arrays.fill(optionSet.logCounts(), 0);
+        Arrays.fill(optionSet.logSums(), 0.0);
+        for (Map<String, Double> byType : optionSet.logSumsByType()) {
+            byType.clear();
+        }
+    }
+
+    /** @return {@code false} si cette ligne prestige a déjà été traitée (évite double déclenchement Lunar). */
+    private static boolean rememberPrestigeLogLineIfNew(String normalizedFingerprint) {
+        if (seenPrestigeLogLineFingerprints.contains(normalizedFingerprint)) {
+            return false;
+        }
+        seenPrestigeLogLineFingerprints.add(normalizedFingerprint);
+        seenPrestigeLogLineOrder.addLast(normalizedFingerprint);
+        while (seenPrestigeLogLineOrder.size() > MAX_SEEN_RECAP_LINE_FINGERPRINTS) {
+            String old = seenPrestigeLogLineOrder.pollFirst();
+            if (old != null) {
+                seenPrestigeLogLineFingerprints.remove(old);
+            }
+        }
+        return true;
+    }
+
     /** @return {@code false} si cette ligne a déjà été comptée pour la section AFK. */
     private static boolean rememberAfkRewardLineIfNew(String normalizedFingerprint) {
         if (seenAfkRewardLineFingerprints.contains(normalizedFingerprint)) {
@@ -3628,15 +3929,27 @@ public final class WorldHudOverlay {
     }
 
     private static void parsePrestigeFromLog(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return;
+        }
         String s = stripLogPrefix(raw);
         if (s.isBlank()) {
             s = stripForRecapFarm(raw);
         }
         if (s.isBlank()) {
+            s = raw.trim();
+            s = ANSI_ESCAPE.matcher(s).replaceAll("");
+            s = LEGACY_FORMATTING_CODES.matcher(s).replaceAll("").trim();
+        }
+        if (s.isBlank()) {
             return;
         }
         String norm = normalizeAsciiLower(s);
-        if (!PRESTIGE_LOG_PHRASE_NORM.matcher(norm).find()) {
+        if (!PRESTIGE_LOG_PHRASE_NORM.matcher(norm).find()
+                && !PRESTIGE_LOG_PHRASE_NORM.matcher(normalizeAsciiLower(raw)).find()) {
+            return;
+        }
+        if (!rememberPrestigeLogLineIfNew(norm)) {
             return;
         }
         long now = System.currentTimeMillis();
@@ -3656,6 +3969,11 @@ public final class WorldHudOverlay {
         prestigeDernierDurationMs = -1L;
         prestigePaused = false;
         prestigeFrozenElapsedMs = 0L;
+        prestigeAutoResumeOnAfkReconnect = false;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client != null) {
+            saveLayout(client);
+        }
     }
 
     /** Pause / reprise du chrono « Actuel » (touche configurable ou bouton sous-menu). */
@@ -3665,12 +3983,70 @@ public final class WorldHudOverlay {
         }
         long now = System.currentTimeMillis();
         if (prestigePaused) {
-            prestigeStartMs = now - prestigeFrozenElapsedMs;
-            prestigePaused = false;
+            resumePrestigeIfPaused();
         } else {
             prestigeFrozenElapsedMs = now - prestigeStartMs;
             prestigePaused = true;
         }
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client != null) {
+            saveLayout(client);
+        }
+    }
+
+    /** Met en pause le chrono sans l’effacer (déconnexion, transfert serveur, fermeture du jeu). */
+    private static void freezePrestigeOnSessionSuspend() {
+        if (!prestigeRunActive || prestigePaused) {
+            return;
+        }
+        prestigeFrozenElapsedMs = Math.max(0L, System.currentTimeMillis() - prestigeStartMs);
+        prestigePaused = true;
+        prestigeAutoResumeOnAfkReconnect = afkRewardLoggingActive || reapplyAfkLoggingOnNextWorldEntry
+                || prestigeAutoResumeOnAfkReconnect;
+    }
+
+    private static void savePrestigeStateTo(Properties p) {
+        p.setProperty("prestige.run_active", String.valueOf(prestigeRunActive));
+        p.setProperty("prestige.paused", String.valueOf(prestigePaused));
+        p.setProperty("prestige.frozen_ms", String.valueOf(prestigeFrozenElapsedMs));
+        p.setProperty("prestige.start_ms", String.valueOf(prestigeStartMs));
+        p.setProperty("prestige.dernier_ms", String.valueOf(prestigeDernierDurationMs));
+        p.setProperty("prestige.resume_on_afk_reconnect", String.valueOf(prestigeAutoResumeOnAfkReconnect));
+    }
+
+    private static void loadPrestigeStateFrom(Properties p) {
+        prestigeRunActive = Boolean.parseBoolean(p.getProperty("prestige.run_active", "false"));
+        prestigePaused = Boolean.parseBoolean(p.getProperty("prestige.paused", "false"));
+        try {
+            prestigeFrozenElapsedMs = Long.parseLong(p.getProperty("prestige.frozen_ms", "0"));
+            prestigeStartMs = Long.parseLong(p.getProperty("prestige.start_ms", "0"));
+            prestigeDernierDurationMs = Long.parseLong(p.getProperty("prestige.dernier_ms", "-1"));
+        } catch (NumberFormatException ignored) {
+            prestigeRunActive = false;
+            prestigePaused = false;
+            prestigeFrozenElapsedMs = 0L;
+            prestigeStartMs = 0L;
+            prestigeDernierDurationMs = -1L;
+            return;
+        }
+        if (!prestigeRunActive) {
+            prestigePaused = false;
+            prestigeFrozenElapsedMs = 0L;
+            prestigeStartMs = 0L;
+        } else if (!prestigePaused) {
+            long elapsed = prestigeFrozenElapsedMs > 0L
+                    ? prestigeFrozenElapsedMs
+                    : Math.max(0L, System.currentTimeMillis() - prestigeStartMs);
+            prestigeStartMs = System.currentTimeMillis() - elapsed;
+        }
+    }
+
+    private static String prestigeTimeTitleString() {
+        String title = Text.translatable("feather_world_menu.prestige_time.title").getString();
+        if (prestigePaused) {
+            title += Text.translatable("feather_world_menu.prestige_time.pause_suffix").getString();
+        }
+        return title;
     }
 
     /** Affiche une durée en secondes, minutes et heures (ex. {@code 45s}, {@code 12m 30s}, {@code 1h 5m}). */
@@ -3863,8 +4239,12 @@ public final class WorldHudOverlay {
                 LOGGER.info("[FeatherWorldMenu] Suivi HUD : lecture incrémentale de {}", logPath);
             }
             long length = file.length();
-            if (logReadOffset > length) {
-                logReadOffset = 0L;
+            boolean logPathChanged = logReadOffsetPath == null || !logReadOffsetPath.equals(logPath);
+            if (logPathChanged) {
+                logReadOffsetPath = logPath;
+                logReadOffset = length;
+            } else if (logReadOffset > length) {
+                logReadOffset = length;
             }
             file.seek(logReadOffset);
             int processed = 0;
@@ -3902,10 +4282,13 @@ public final class WorldHudOverlay {
     }
 
     private static void tickAutoFishScheduledSecondUse(MinecraftClient client) {
-        if (!autoFishSecondUseScheduled) {
+        if (autoFishSecondUseDueAtMs <= 0L) {
             return;
         }
-        autoFishSecondUseScheduled = false;
+        if (System.currentTimeMillis() < autoFishSecondUseDueAtMs) {
+            return;
+        }
+        autoFishSecondUseDueAtMs = 0L;
         performAutoFishUseInteraction(client);
     }
 
@@ -3936,7 +4319,7 @@ public final class WorldHudOverlay {
 
     /**
      * Déclenché sur une ligne {@code latest.log} (vanilla ou Lunar) : premier « utiliser » tout de suite,
-     * second au tick suivant (équivalent double-clic droit, fonctionne même si le tchat est ouvert).
+     * second après {@link #AUTOFISH_SECOND_USE_DELAY_MS} ms (équivalent double-clic droit).
      */
     private static void parseAutoFishLogTriggerFromLog(String raw) {
         if (!autoFishLogTriggerEnabled || !logLineMatchesAutoFishTrigger(raw)) {
@@ -3947,7 +4330,7 @@ public final class WorldHudOverlay {
             return;
         }
         performAutoFishUseInteraction(c);
-        autoFishSecondUseScheduled = true;
+        autoFishSecondUseDueAtMs = System.currentTimeMillis() + AUTOFISH_SECOND_USE_DELAY_MS;
     }
 
     private static void parseEnchantOptionExactLogLine(String raw) {
@@ -4253,8 +4636,18 @@ public final class WorldHudOverlay {
         String t = s.trim();
         String norm = normalizeAsciiLower(t);
         if (AFK_ON_PATTERN.matcher(norm).find() || t.equals(AFK_LOG_ON_EXACT)) {
+            if (afkWorldEntryProbeActive) {
+                afkWorldEntryProbeResolved = true;
+            }
             if (reconnectAfkCommandWatchActive) {
                 reconnectAfkCommandWatchActive = false;
+            }
+            if (prestigeRunActive && prestigePaused) {
+                if (prestigeAutoResumeOnAfkReconnect) {
+                    resumePrestigeAfterAfkReconnect();
+                } else {
+                    resumePrestigeIfPaused();
+                }
             }
             if (!afkRewardLoggingActive) {
                 afkAwaitingLocalActivityClearAfterReconnect = false;
@@ -4274,6 +4667,9 @@ public final class WorldHudOverlay {
                 reconnectAfkActivityBaseline = null;
             }
         } else if (AFK_OFF_PATTERN.matcher(norm).find() || t.equals(AFK_LOG_OFF_EXACT)) {
+            if (afkWorldEntryProbeActive) {
+                afkWorldEntryProbeResolved = true;
+            }
             if (afkRewardLoggingActive) {
                 clearAfkLoggingClientStateAsIfLeft();
             }
@@ -5172,6 +5568,93 @@ public final class WorldHudOverlay {
         return formatEventRemaining(slot.endMs);
     }
 
+    private static boolean isPotionSlotActive(PotionSlot slot, long nowMs) {
+        return slot.endMs > nowMs;
+    }
+
+    private static List<PotionSlot> activePotionSlotsOrdered(long nowMs) {
+        ArrayList<PotionSlot> out = new ArrayList<>();
+        for (PotionSlot slot : POTION_SLOTS.values()) {
+            if (isPotionSlotActive(slot, nowMs)) {
+                out.add(slot);
+            }
+        }
+        return out;
+    }
+
+    private static int potionSectionLineHeight(MinecraftClient client) {
+        return client.textRenderer.fontHeight + 2;
+    }
+
+    private static String potionSlotLineText(PotionSlot slot) {
+        return slot.label + "  " + potionPercentVisible(slot) + "  " + formatPotionCountdown(slot);
+    }
+
+    /** Hauteur du bloc Potion docké : titre + une ligne par boost actif uniquement. */
+    private static int potionSectionDockedHeight(MinecraftClient client) {
+        int active = activePotionSlotsOrdered(System.currentTimeMillis()).size();
+        int slotH = potionSectionLineHeight(client);
+        if (active == 0) {
+            return 2 + 7;
+        }
+        return 2 + 8 + active * (slotH + 1);
+    }
+
+    /** Largeur minimale pour afficher la ligne la plus longue (panneau flottant Potion). */
+    private static int potionSectionMinContentWidth(MinecraftClient client) {
+        long now = System.currentTimeMillis();
+        int max = client.textRenderer.getWidth(Text.literal("Potion"));
+        for (PotionSlot slot : activePotionSlotsOrdered(now)) {
+            max = Math.max(max, client.textRenderer.getWidth(Text.literal(potionSlotLineText(slot))));
+        }
+        return max + 2 * CARD_INSET + CARD_TEXT_X + 8;
+    }
+
+    private static int floatingPotionPanelWidth(MinecraftClient client, int idx) {
+        int saved = hudSectionFloatWidth(idx);
+        int needed = Math.max(MIN_CARD_WIDTH, potionSectionMinContentWidth(client));
+        int w = Math.max(saved, needed);
+        if (w > hudSectionFloatW[idx]) {
+            hudSectionFloatW[idx] = w;
+        }
+        return w;
+    }
+
+    private static int hudSectionDisplayWidth(MinecraftClient client, int idx) {
+        if (idx == 6 && showHudPotions) {
+            return floatingPotionPanelWidth(client, idx);
+        }
+        return hudSectionFloatWidth(idx);
+    }
+
+    private static int drawPotionSectionContent(DrawContext context, MinecraftClient client, int x, int line, int width,
+            int right, int layoutWidth, boolean floatSolid, int[] potRowHolder) {
+        int potionTop = line;
+        context.fill(x + CARD_INSET, potionTop, right - CARD_INSET, potionTop + 7,
+                hudLayerArgb(0x66301810, floatSolid));
+        context.drawText(client.textRenderer,
+                Text.literal(trimHudSectionLine(client, "Potion", layoutWidth)),
+                x + CARD_TEXT_X, potionTop - 2, 0xFFB388FF, false);
+        int potRow = potionTop + 8;
+        int slotH = potionSectionLineHeight(client);
+        long potNow = System.currentTimeMillis();
+        for (PotionSlot slot : activePotionSlotsOrdered(potNow)) {
+            context.fill(x + CARD_INSET, potRow - 1, right - CARD_INSET, potRow + slotH - 1,
+                    hudLayerArgb(0x44281830, floatSolid));
+            context.drawBorder(x + CARD_INSET, potRow - 1, width - 2 * CARD_INSET, slotH,
+                    hudLayerArgb(0x88604080, floatSolid));
+            String potionText = potionSlotLineText(slot);
+            context.drawText(client.textRenderer,
+                    Text.literal(trimHudSectionLine(client, potionText, layoutWidth)),
+                    x + CARD_TEXT_X, potRow, 0xFFE1BEE7, false);
+            potRow += slotH + 1;
+        }
+        if (potRowHolder != null) {
+            potRowHolder[0] = potRow;
+        }
+        return potRow;
+    }
+
     /** Pourcentage affiché : repasse à {@code --%} dès que le boost est terminé. */
     private static String potionPercentVisible(PotionSlot slot) {
         long now = System.currentTimeMillis();
@@ -5299,8 +5782,7 @@ public final class WorldHudOverlay {
                         hudLayerArgb(0x55201828, floatSolid));
                 context.drawBorder(x + CARD_INSET, prestigeTop, width - 2 * CARD_INSET, prestigeBoxH,
                         hudLayerArgb(0xAA8A4A6A, floatSolid));
-                String pTitleShown = trimHudSectionLine(client,
-                        Text.translatable("feather_world_menu.prestige_time.title").getString(), layoutWidth);
+                String pTitleShown = trimHudSectionLine(client, prestigeTimeTitleString(), layoutWidth);
                 context.drawText(client.textRenderer, Text.literal(pTitleShown),
                         x + CARD_TEXT_X, prestigeTop + 1, 0xFFFFB2DD, false);
                 long nowMs = System.currentTimeMillis();
@@ -5524,34 +6006,7 @@ public final class WorldHudOverlay {
                 }
                 yield doubleBoxBottom + SECTION_BLOCK_TAIL_PAD;
             }
-            case 6 -> {
-                int potionTop = line;
-                context.fill(x + CARD_INSET, potionTop, right - CARD_INSET, potionTop + 7,
-                        hudLayerArgb(0x66301810, floatSolid));
-                context.drawText(client.textRenderer,
-                        Text.literal(trimHudSectionLine(client, "Potion", layoutWidth)),
-                        x + CARD_TEXT_X, potionTop - 2, 0xFFB388FF, false);
-                int potRow = potionTop + 8;
-                int slotH = 10;
-                long potNow = System.currentTimeMillis();
-                for (PotionSlot slot : POTION_SLOTS.values()) {
-                    context.fill(x + CARD_INSET, potRow - 1, right - CARD_INSET, potRow + slotH - 1,
-                            hudLayerArgb(0x44281830, floatSolid));
-                    context.drawBorder(x + CARD_INSET, potRow - 1, width - 2 * CARD_INSET, slotH,
-                            hudLayerArgb(0x88604080, floatSolid));
-                    String potionText = slot.label + "  " + potionPercentVisible(slot) + "  " + formatPotionCountdown(slot);
-                    int col = slot.endMs > potNow ? 0xFFE1BEE7 : 0xFF9E9E9E;
-                    context.drawText(client.textRenderer,
-                            Text.literal(trimHudSectionLine(client, potionText, layoutWidth)),
-                            x + CARD_TEXT_X, potRow, col, false);
-                    potRow += slotH + 1;
-                    // La phrase « Vous avez reçu un boost … » n’est plus affichée dans la section.
-                }
-                if (potRowHolder != null) {
-                    potRowHolder[0] = potRow;
-                }
-                yield potRow;
-            }
+            case 6 -> drawPotionSectionContent(context, client, x, line, width, right, layoutWidth, floatSolid, potRowHolder);
             default -> line;
         };
     }
@@ -5563,7 +6018,7 @@ public final class WorldHudOverlay {
             }
             int fx = hudSectionFloatX[idx];
             int fy = hudSectionFloatY[idx];
-            int w = hudSectionFloatWidth(idx);
+            int w = hudSectionDisplayWidth(client, idx);
             int h = getHudFloatPanelHeight(client, idx);
             if (h <= 0) {
                 continue;
@@ -5591,7 +6046,7 @@ public final class WorldHudOverlay {
     }
 
     private static void drawFloatingSectionCloseButton(DrawContext context, MinecraftClient client, int idx) {
-        int left = floatingSectionCloseLeft(idx);
+        int left = floatingSectionCloseLeft(client, idx);
         int top = floatingSectionCloseTop(idx);
         context.fill(left, top, left + FLOAT_CLOSE_BTN_SIZE, top + FLOAT_CLOSE_BTN_SIZE, 0xFFB71C1C);
         context.drawBorder(left, top, FLOAT_CLOSE_BTN_SIZE, FLOAT_CLOSE_BTN_SIZE, 0xFFFF8A80);
@@ -5756,7 +6211,7 @@ public final class WorldHudOverlay {
     /** Ligne titre Prestige : case + libellé ; clear/pause sur la ligne suivante. */
     private static void drawPrestigeSubmenuTitleRow(DrawContext context, MinecraftClient client, int sx, int ry, Text rowTitle,
             int scrollTrackLeft, int sectionIdx) {
-        drawSectionsSubmenuRowTitleWithInfoBadge(context, client, sx, ry, rowTitle, scrollTrackLeft, sectionIdx);
+        drawSectionsSubmenuRowTitleWithInfoBadge(context, client, sx, ry, Text.literal(prestigeTimeTitleString()), scrollTrackLeft, sectionIdx);
     }
 
     /** Ligne « ↳ » + boutons « clear » / « pause »|« resume » (minuscules, texte collé au bord gauche de la case). */
@@ -5903,8 +6358,24 @@ public final class WorldHudOverlay {
         return SECTIONS_ROW_H - 2;
     }
 
-    private static int enchantPanelScrollContentTop(int innerTop) {
-        return innerTop + enchantTopBtnH() + 3;
+    private static int enchantPanelScrollTrackLeft(int panelLeft, int panelWidth) {
+        return panelLeft + panelWidth - SCROLLBAR_TRACK_W - SCROLLBAR_PAD;
+    }
+
+    private static int minEnchantPanelWidth(MinecraftClient client) {
+        int buttonsW = sectionsEnchantCumulsBtnW(client) + ENCHANT_OPTIONS_TOP_BTN_GAP
+                + sectionsEnchantTopSortBtnW(client) + ENCHANT_OPTIONS_TOP_BTN_GAP
+                + sectionsEnchantResetBtnW(client);
+        return Math.max(MIN_ENCHANT_PANEL_W, 2 * CARD_INSET + SCROLLBAR_TRACK_W + SCROLLBAR_PAD + buttonsW + 6);
+    }
+
+    private static int enchantPanelScrollContentTop(MinecraftClient client, int innerTop, int innerLeft, int maxRightExclusive) {
+        EnchantOptionsTopBtnRowLayout row = layoutEnchantTopButtonRow(client, innerLeft, innerTop, maxRightExclusive);
+        return row.bottom() + 3;
+    }
+
+    private static String enchantResetButtonLabel() {
+        return Text.translatable("feather_world_menu.enchant.reset_button").getString();
     }
 
     private static int enchantOptionsEnchantButtonsTop(MinecraftClient client, int innerTop) {
@@ -5921,6 +6392,10 @@ public final class WorldHudOverlay {
         int wProc = client.textRenderer.getWidth(Text.translatable("feather_world_menu.enchant.top_proc_button"));
         int wCumuls = client.textRenderer.getWidth(Text.translatable("feather_world_menu.enchant.top_cumuls_button"));
         return Math.max(wProc, wCumuls) + SECTIONS_BTN_TEXT_PAD;
+    }
+
+    private static int sectionsEnchantResetBtnW(MinecraftClient client) {
+        return client.textRenderer.getWidth(Text.literal(enchantResetButtonLabel())) + SECTIONS_BTN_TEXT_PAD;
     }
 
     private record EnchantOptionsCumulsBtnLayout(int left, int top, int width, int height) {
@@ -5943,22 +6418,66 @@ public final class WorldHudOverlay {
         }
     }
 
-    private record EnchantOptionsTopBtnRowLayout(EnchantOptionsCumulsBtnLayout cumuls, EnchantOptionsTopSortBtnLayout topSort) {
+    private record EnchantOptionsResetBtnLayout(int left, int top, int width, int height) {
+        int right() {
+            return left + width;
+        }
+
         int bottom() {
-            return Math.max(cumuls.bottom(), topSort.bottom());
+            return top + height;
         }
     }
 
-    private static EnchantOptionsTopBtnRowLayout layoutEnchantTopButtonRow(MinecraftClient client, int innerLeft, int topY) {
-        int h = enchantTopBtnH();
-        EnchantOptionsCumulsBtnLayout cumuls = new EnchantOptionsCumulsBtnLayout(innerLeft, topY, sectionsEnchantCumulsBtnW(client), h);
-        int topLeft = cumuls.right() + ENCHANT_OPTIONS_TOP_BTN_GAP;
-        EnchantOptionsTopSortBtnLayout topSort = new EnchantOptionsTopSortBtnLayout(topLeft, topY, sectionsEnchantTopSortBtnW(client), h);
-        return new EnchantOptionsTopBtnRowLayout(cumuls, topSort);
+    private record EnchantOptionsTopBtnRowLayout(EnchantOptionsCumulsBtnLayout cumuls, EnchantOptionsTopSortBtnLayout topSort,
+            EnchantOptionsResetBtnLayout reset) {
+        int bottom() {
+            return Math.max(Math.max(cumuls.bottom(), topSort.bottom()), reset.bottom());
+        }
     }
 
-    private static void drawEnchantTopButtonRow(DrawContext context, MinecraftClient client, int innerLeft, int topY) {
-        EnchantOptionsTopBtnRowLayout row = layoutEnchantTopButtonRow(client, innerLeft, topY);
+    private static EnchantOptionsTopBtnRowLayout layoutEnchantTopButtonRow(MinecraftClient client, int innerLeft, int topY,
+            int maxRightExclusive) {
+        int h = enchantTopBtnH();
+        int gap = ENCHANT_OPTIONS_TOP_BTN_GAP;
+        int available = Math.max(0, maxRightExclusive - innerLeft);
+        int cumulsW = sectionsEnchantCumulsBtnW(client);
+        int topSortFullW = sectionsEnchantTopSortBtnW(client);
+        int resetW = sectionsEnchantResetBtnW(client);
+        int minTopSortW = client.textRenderer.getWidth(Text.literal("top :")) + SECTIONS_BTN_TEXT_PAD;
+
+        int singleRowTotal = cumulsW + gap + topSortFullW + gap + resetW;
+        if (singleRowTotal <= available) {
+            EnchantOptionsCumulsBtnLayout cumuls = new EnchantOptionsCumulsBtnLayout(innerLeft, topY, cumulsW, h);
+            int topLeft = cumuls.right() + gap;
+            EnchantOptionsTopSortBtnLayout topSort = new EnchantOptionsTopSortBtnLayout(topLeft, topY, topSortFullW, h);
+            int resetLeft = topSort.right() + gap;
+            EnchantOptionsResetBtnLayout reset = new EnchantOptionsResetBtnLayout(resetLeft, topY, resetW, h);
+            return new EnchantOptionsTopBtnRowLayout(cumuls, topSort, reset);
+        }
+
+        int topSortShrunkW = Math.min(topSortFullW, Math.max(minTopSortW, available - cumulsW - gap - gap - resetW));
+        int shrunkRowTotal = cumulsW + gap + topSortShrunkW + gap + resetW;
+        if (shrunkRowTotal <= available) {
+            EnchantOptionsCumulsBtnLayout cumuls = new EnchantOptionsCumulsBtnLayout(innerLeft, topY, cumulsW, h);
+            int topLeft = cumuls.right() + gap;
+            EnchantOptionsTopSortBtnLayout topSort = new EnchantOptionsTopSortBtnLayout(topLeft, topY, topSortShrunkW, h);
+            int resetLeft = topSort.right() + gap;
+            EnchantOptionsResetBtnLayout reset = new EnchantOptionsResetBtnLayout(resetLeft, topY, resetW, h);
+            return new EnchantOptionsTopBtnRowLayout(cumuls, topSort, reset);
+        }
+
+        int row2Y = topY + h + 2;
+        int topSortRowW = Math.min(topSortFullW, Math.max(minTopSortW, available - cumulsW - gap));
+        EnchantOptionsCumulsBtnLayout cumuls = new EnchantOptionsCumulsBtnLayout(innerLeft, topY, cumulsW, h);
+        EnchantOptionsTopSortBtnLayout topSort = new EnchantOptionsTopSortBtnLayout(cumuls.right() + gap, topY, topSortRowW, h);
+        int resetRowW = Math.min(resetW, available);
+        EnchantOptionsResetBtnLayout reset = new EnchantOptionsResetBtnLayout(innerLeft, row2Y, resetRowW, h);
+        return new EnchantOptionsTopBtnRowLayout(cumuls, topSort, reset);
+    }
+
+    private static void drawEnchantTopButtonRow(DrawContext context, MinecraftClient client, int innerLeft, int topY,
+            int maxRightExclusive) {
+        EnchantOptionsTopBtnRowLayout row = layoutEnchantTopButtonRow(client, innerLeft, topY, maxRightExclusive);
         EnchantOptionsCumulsBtnLayout cumuls = row.cumuls();
         drawCacherToggleBtn(context, client, cumuls.left(), cumuls.top(), cumuls.width(), cumuls.height(),
                 Text.translatable("feather_world_menu.enchant.cumuls_button").getString(), enchantShowCumulativeSums);
@@ -5968,6 +6487,8 @@ public final class WorldHudOverlay {
                 : Text.translatable("feather_world_menu.enchant.top_proc_button");
         String sortShown = client.textRenderer.trimToWidth(sortLabel.getString(), Math.max(8, topSort.width() - 4));
         drawCacherToggleBtn(context, client, topSort.left(), topSort.top(), topSort.width(), topSort.height(), sortShown, true);
+        EnchantOptionsResetBtnLayout reset = row.reset();
+        drawCacherToggleBtn(context, client, reset.left(), reset.top(), reset.width(), reset.height(), enchantResetButtonLabel(), true);
     }
 
     private static int computeEnchantOptionsContentHeight(MinecraftClient client) {
@@ -5987,7 +6508,9 @@ public final class WorldHudOverlay {
 
     private static int computeEnchantPanelContentHeight(MinecraftClient client) {
         int innerTop = 0;
-        int contentTop = enchantPanelScrollContentTop(innerTop);
+        int innerLeft = CARD_INSET;
+        int scrollTrackLeft = enchantPanelScrollTrackLeft(0, enchantWidth);
+        int contentTop = enchantPanelScrollContentTop(client, innerTop, innerLeft, scrollTrackLeft);
         int titleY = contentTop + 1;
         int entriesTop = titleY + client.textRenderer.fontHeight + 4;
         int entriesRight = Math.max(CARD_INSET + 1, enchantWidth - SCROLLBAR_TRACK_W - SCROLLBAR_PAD - 4);

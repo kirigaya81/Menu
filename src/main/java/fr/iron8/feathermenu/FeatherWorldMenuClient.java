@@ -6,7 +6,6 @@ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import org.lwjgl.glfw.GLFW;
@@ -17,11 +16,8 @@ public class FeatherWorldMenuClient implements ClientModInitializer {
     private static KeyBinding toggleSectionsKey;
     private static KeyBinding closeSectionsKey;
     private static KeyBinding prestigePauseKey;
-    /** Suis l’écran pause (Feather transparent ou menu Minecraft classique). */
-    private static boolean wasPauseMenuOpen = false;
-    /** Distingue les deux écrans pour activer / couper le mode édition selon le contexte. */
-    private static boolean wasFeatherPauseOpen = false;
-    private static boolean wasVanillaGameMenuOpen = false;
+    /** Menu Minecraft (quitter, options…) — pas l’écran pause Feather transparent. */
+    private static boolean wasMinecraftGameMenuOpen = false;
     private static int toggleHudKeyCode = GLFW.GLFW_KEY_H;
     private static int toggleVisibleKeyCode = GLFW.GLFW_KEY_F6;
     private static int toggleSectionsKeyCode = GLFW.GLFW_KEY_ESCAPE;
@@ -86,24 +82,11 @@ public class FeatherWorldMenuClient implements ClientModInitializer {
                 WorldHudOverlay.togglePrestigePause();
             }
 
-            boolean featherPauseOpen = client.currentScreen instanceof FeatherPauseScreen;
-            // FeatherGameMenuScreen hérite de GameMenuScreen, donc cette branche couvre les deux.
-            boolean vanillaGameMenuOpen = client.currentScreen instanceof GameMenuScreen;
-            boolean pauseMenuOpen = featherPauseOpen || vanillaGameMenuOpen;
-
-            if (featherPauseOpen && !wasFeatherPauseOpen) {
-                WorldHudOverlay.onFeatherPauseOpened(client);
-            }
-            if (vanillaGameMenuOpen && !wasVanillaGameMenuOpen) {
-                WorldHudOverlay.onVanillaGameMenuOpened(client);
-            }
-            if (client.currentScreen == null && wasPauseMenuOpen) {
+            boolean minecraftMenuOpen = WorldHudOverlay.isMinecraftGameMenuScreenOpen(client);
+            if (!minecraftMenuOpen && wasMinecraftGameMenuOpen) {
                 WorldHudOverlay.onGameMenuClosed(client);
             }
-
-            wasFeatherPauseOpen = featherPauseOpen;
-            wasVanillaGameMenuOpen = vanillaGameMenuOpen;
-            wasPauseMenuOpen = pauseMenuOpen;
+            wasMinecraftGameMenuOpen = minecraftMenuOpen;
         });
     }
 
